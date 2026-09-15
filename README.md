@@ -17,7 +17,7 @@
 
 > ⛔ **ممنوع يتضاف `index.html` هنا.** الأداة **مالهاش نسخة مستقلة بقرار**
 > (أحمد · 15-09-2026) — الدخول بيحصل مرة واحدة في الهب، والسر سر مجموعة
-> `warehouse_ops`.
+> `delivery_cod_ops`.
 
 > 🔴 **قراءة بحتة** — صفر كتابة على شوبيفاي، وصفر صف في D1، ومفيش
 > `[[d1_databases]]` أصلاً.
@@ -34,7 +34,7 @@ GET  ?action=get_shipped_queue أوردرات Shipped (الماكينتين) ب�
 
 منشور من git عبر **Workers Builds** على `main`.
 الأسرار من الداشبورد ثم **Promote**: `WORKER_SECRET` (= سر مجموعة
-`warehouse_ops`) · `CLIENT_ID` · `CLIENT_SECRET`.
+`delivery_cod_ops`) · `CLIENT_ID` · `CLIENT_SECRET`.
 
 التفاصيل والقرارات والفخاخ → **`CLAUDE.md`**
 
