@@ -2,7 +2,7 @@
 
 # طابور الأوردرات المشحونة — Shipped Orders
 
-![worker](https://img.shields.io/badge/worker-v1.1.0-blue)
+![worker](https://img.shields.io/badge/worker-v1.2.0-blue)
 
 **Worker بس — مفيش واجهة في الريبو ده.**
 

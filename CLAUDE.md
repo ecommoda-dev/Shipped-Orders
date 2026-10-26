@@ -2,14 +2,14 @@
 
 # طابور الأوردرات المشحونة — Shipped Orders (`Shipped-Orders`)
 
-![version](https://img.shields.io/badge/worker-v1.1.0-blue)
+![version](https://img.shields.io/badge/worker-v1.2.0-blue)
 
 **بتعمل إيه:** بترجّع الأوردرات اللي حالتها **`Shipped`** — يعني خرجت
 و**محدش سجّل لها نتيجة نهائية** (`Delivered` / `Returned`) لسه، في الشحنة
 الأصلية (`custom.manual_status`) أو دورة الاستبدال/الاسترجاع
 (`custom.status_2_r_e`).
 **مين بيستخدمها:** الشحن والتحصيل
-**الإصدار:** `1.1.0` (`WORKER_VERSION` في `index.js`)
+**الإصدار:** `1.2.0` (`WORKER_VERSION` في `index.js`)
 
 > 🔴 **الريبو ده Worker وبس — مفيش واجهة هنا ومفيش نسخة مستقلة** (قرار أحمد
 > 15-09-2026، بنفس سابقة `Package-Transfer-To-Office`). الواجهة الوحيدة هي
@@ -114,7 +114,7 @@ created_at:>='<بداية 01/04/2026 بتوقيت القاهرة>'     ← ال�
 ## الحقول الراجعة — عقد مع الواجهة
 
 `shapeOrder` بيرجّع: `orderId` (رقمي) · `orderGid` · `orderName` · `createdAt` ·
-`cancelledAt` · `fulfillment` · `financial` · `customer` · `city` · `province` ·
+`cancelledAt` · `fulfillment` · `financial` · `customer` · **`address1` · `address2`** (من `1.2.0`) · `city` · `province` ·
 `itemsQty` · `total` · `currency` · `zone` · `courier` · `s1` · `s2` ·
 `packedAtS1`/`S2` · `packedByS1`/`S2` · `trackingS1`/`S2` · `trackingLegacy`.
 
@@ -285,12 +285,13 @@ node docs/queues-check.mjs      # ٨٠ بند للهب كله
 | shopify-graphql-helper | **v1.1.0** |
 | ecommoda-html-builder | **v6.6.0** |
 
-آخر مطابقة: 17-09-2026 · الـ Worker `1.1.0`
+آخر مطابقة: 26-10-2026 · الـ Worker `1.2.0`
 🔴 معلّقة: **تسجيل مجموعة `delivery_cod_ops` في `ecommoda-constants`**
 
 ---
 
-آخر تحديث: 17-09-2026 — `1.1.0` (**أرضية تاريخ الطابور** — طلب أحمد:
+آخر تحديث: 26-10-2026 — `1.2.0` (**`address1`/`address2` في رد `get_shipped_queue`** — طلب أحمد: عمود «العنوان» في `Shipped-Orders.html` بالهب (بعد المندوب). سكالرين جوّه `shippingAddress` الموجود = صفر زيادة في تكلفة الاستعلام. الهب `shipped.min` بقى `1.2.0` — **انشر الـ Worker قبل الصفحة**)
+`1.1.0` (**أرضية تاريخ الطابور** — طلب أحمد:
 الاستعلام بقى فيه `created_at:>=` جنب شرط الحالة، والطابور بيبدأ من
 أوردرات **`01/04/2026`** واللي أقدم **مابيتجابش**. اليوم بتوقيت القاهرة
 بيتحوّل للحظة UTC بـ`Intl` (`cairoDayStartUtcISO`) مش بيتبعت مجرّد ·
