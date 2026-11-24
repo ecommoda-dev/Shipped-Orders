@@ -2,14 +2,14 @@
 
 # طابور الأوردرات المشحونة — Shipped Orders (`Shipped-Orders`)
 
-![version](https://img.shields.io/badge/worker-v1.2.0-blue)
+![version](https://img.shields.io/badge/worker-v1.3.0-blue)
 
 **بتعمل إيه:** بترجّع الأوردرات اللي حالتها **`Shipped`** — يعني خرجت
 و**محدش سجّل لها نتيجة نهائية** (`Delivered` / `Returned`) لسه، في الشحنة
 الأصلية (`custom.manual_status`) أو دورة الاستبدال/الاسترجاع
 (`custom.status_2_r_e`).
 **مين بيستخدمها:** الشحن والتحصيل
-**الإصدار:** `1.2.0` (`WORKER_VERSION` في `index.js`)
+**الإصدار:** `1.3.0` (`WORKER_VERSION` في `index.js`)
 
 > 🔴 **الريبو ده Worker وبس — مفيش واجهة هنا ومفيش نسخة مستقلة** (قرار أحمد
 > 15-09-2026، بنفس سابقة `Package-Transfer-To-Office`). الواجهة الوحيدة هي
@@ -118,6 +118,18 @@ created_at:>='<بداية 01/04/2026 بتوقيت القاهرة>'     ← ال�
 `itemsQty` · `total` · `currency` · `zone` · `courier` · `s1` · `s2` ·
 `packedAtS1`/`S2` · `packedByS1`/`S2` · `trackingS1`/`S2` · `trackingLegacy`.
 
+- 🟢 **`1.3.0` — «تاريخ الطلب [S2]» ونوع الدورة** (طلب أحمد 24-11-2026 · `order-lifecycle` v1.11.1 · نفس منطق `In-Return-Orders` 1.3.0 بالحرف):
+  `returnRequestedAt` (= `Return.createdAt` لأحدث دورة غير ملغية، مرتّبة بـ`createdAt` — Rule 15) · `returnName` · `returnStatus` · `returnCycles` ·
+  `returnKind` = `exchange` | `return` | `null` — **النوع النهائي** لأحدث دورة من **دفتر المبيعات `order.agreements`** (قاعدة 8 · §2-D) —
+  🔴 **مش من `exchangeLineItems` ومش من S2** (تعديل الأوردر بعد الإنشاء بيغيّر النوع من غير ما يلمس الـ Return) · `returnFlags`
+  (`TYPE_CONFLICT` · `EDITED_AFTER_RETURN` · `EDIT_AFTER_CLOSE` · `EDIT_BETWEEN_CYCLES` · `NO_AGREEMENT`) — **بتتعلّم ومابتتحرّكش** (قاعدة 13).
+  - `null` على صف S1 (شحنة أصلية) — مالوش Return أصلاً؛ مش خطأ. العمود في الواجهة اسمه **«تاريخ الطلب [S2]»** عشان كده.
+  - 🔴 **بتتطلب `read_returns`** وغيابها بيوقّع الطابور كله (بند في `diag`). `returns(first: 10, reverse: true)` بـ`id name createdAt status` بس.
+  - الدفتر بتمريرة تانية `nodes(ids:)` لأوردرات عليها Return بس: شرايح `CYCLE_TYPES_CHUNK = 8` (١٠ بتتخطّى سقف ١٠٠٠) · `agreements(first: 50)` **مع** `hasNextPage`
+    (بيكمّل صفحات لحد `AGREEMENTS_MAX_PAGES`) · `ProductSale { lineItem { id } }` إلزامي (#66895) · دفتر ناقص **مايتصنّفش** (`null`).
+  - 🔴 فشل التمريرة دي **ما بيوقّعش الطابور** — `returnKindError` في الرد والنوع `null` (الواجهة بترجع للتسمية العامة).
+  - ⚠️ **التكلفة مش مقيسة بعد الإضافة** (`QUEUE_PAGE_SIZE` لسه 40 زي `In-Return-Orders` بنفس شكل الاستعلام) — راجع `queryCost` (`op: 'cycleTypes'`) أول فتح قبل أي تكبير.
+  - ⚠️ `readCycleTypes()` نسخة من المهارة بالحرف — أي تعديل عليها يتعمل في `In-Return-Orders` في نفس التمريرة (درس R1).
 - ⚠️ **الشكل ده عقد**: `dcoShapeRow` و`dcoFlags` و`dcoCod` في الـ shell بيقروا
   المفاتيح دي **بالاسم**. تغيير اسم مفتاح هنا = عمود بيرجع `—` على كل صف
   **بلا أي خطأ في الكونسول**.
@@ -281,16 +293,17 @@ node docs/queues-check.mjs      # ٨٠ بند للهب كله
 |---|---|
 | ecommoda-worker-builder | **v3.3.0** |
 | ecommoda-constants | **v2.6.0** |
-| ecommoda-order-lifecycle | **v1.8.0** |
+| ecommoda-order-lifecycle | **v1.11.1** (`returnKind`/`returnFlags` من الدفتر فقط — باقي الملف على v1.8.0) |
 | shopify-graphql-helper | **v1.1.0** |
 | ecommoda-html-builder | **v6.6.0** |
 
-آخر مطابقة: 26-10-2026 · الـ Worker `1.2.0`
+آخر مطابقة: 24-11-2026 · الـ Worker `1.3.0`
 🔴 معلّقة: **تسجيل مجموعة `delivery_cod_ops` في `ecommoda-constants`**
 
 ---
 
-آخر تحديث: 26-10-2026 — `1.2.0` (**`address1`/`address2` في رد `get_shipped_queue`** — طلب أحمد: عمود «العنوان» في `Shipped-Orders.html` بالهب (بعد المندوب). سكالرين جوّه `shippingAddress` الموجود = صفر زيادة في تكلفة الاستعلام. الهب `shipped.min` بقى `1.2.0` — **انشر الـ Worker قبل الصفحة**)
+آخر تحديث: 24-11-2026 — `1.3.0` (**«تاريخ الطلب [S2]» + نوع الدورة (استبدال/استرجاع) من دفتر `order.agreements`** على `order-lifecycle` v1.11.1 · قاعدة 8 — طلب أحمد. حقول جديدة في رد `get_shipped_queue`: `returnRequestedAt` · `returnName` · `returnStatus` · `returnCycles` · `returnKind` · `returnFlags` + `returnKindError` و`queryCost` · وبند `read_returns` في `diag`. الهب `shipped.min` بقى `1.3.0` (v2.11.0) — **انشر الـ Worker قبل الصفحة** وأضف `read_returns` على الـ Custom App. ما اتجرّبش على شوبيفاي حقيقية، والتكلفة مش مقيسة.)
+`1.2.0` (**`address1`/`address2` في رد `get_shipped_queue`** — طلب أحمد: عمود «العنوان» في `Shipped-Orders.html` بالهب (بعد المندوب). سكالرين جوّه `shippingAddress` الموجود = صفر زيادة في تكلفة الاستعلام. الهب `shipped.min` بقى `1.2.0` — **انشر الـ Worker قبل الصفحة**)
 `1.1.0` (**أرضية تاريخ الطابور** — طلب أحمد:
 الاستعلام بقى فيه `created_at:>=` جنب شرط الحالة، والطابور بيبدأ من
 أوردرات **`01/04/2026`** واللي أقدم **مابيتجابش**. اليوم بتوقيت القاهرة
