@@ -3,8 +3,8 @@
 // Worker: shipped-orders-worker — EcomModa
 // Tool:   طابور الأوردرات المشحونة (Shipped Orders)
 //
-// skills: worker-builder v3.3.0 · constants v2.6.0 · order-lifecycle v1.8.0
-//         · shopify-graphql-helper v1.1.0 · html-builder v6.6.0 — 15-09-2026
+// skills: worker-builder v3.3.0 · constants v2.6.0 · order-lifecycle v1.11.1
+//         · shopify-graphql-helper v1.1.0 · html-builder v6.6.0 — 24-11-2026
 //
 // 🔴 الأداة دي **مالهاش واجهة مستقلة** — الواجهة الوحيدة هي `shipped-orders.html`
 //    جوّه `Delivery-COD-Operations-Center`. الريبو ده Worker وبس، بنفس سابقة
@@ -24,7 +24,7 @@
 //       بيفترقوا مع أول تعديل (درس R1 · v1.11.0 في هب المخزن: الرئيسية قالت
 //       «بوسطة ٦٦» والصفحة فتحت على ٦).
 // ══════════════════════════════════════════════════════════════
-const WORKER_VERSION = '1.2.0';
+const WORKER_VERSION = '1.3.0';   // 1.3.0: «تاريخ الطلب [S2]» (returnRequestedAt…) + returnKind/returnFlags من دفتر agreements (order-lifecycle v1.11.1 · §2-D)
 const TOOL_LABEL     = 'shipped_orders';   // للتعريف في `diag` بس — **مش** قيمة `tool` في D1
 
 // ══════════════════════════════════════════════════════════════
@@ -236,8 +236,8 @@ async function getAccessToken(env) {
 // ⚠️ ④ هو الخطير: استعلام بيترفض على مستوى الحقل بيرجّع
 //    {"errors":[…],"data":null} — وكود بيقرا `data.orders` بس بيقرا ده
 //    **طابور فاضي** بدل خطأ.
-let _lastThrottle = null;   // بيتعرض في diag — الاقتراب من السقف مابيبانش غير بانفجار
-async function shopifyGQL(env, token, query, variables = {}, opName = 'shopify') {
+let _lastThrottle = null, _lastQueryCost = null;
+async function shopifyGQL(env, token, query, variables = {}, opName = 'shopify', costLog = null) {
   const MAX_ATTEMPTS = 3;
   let lastErr = null;
 
@@ -280,7 +280,13 @@ async function shopifyGQL(env, token, query, variables = {}, opName = 'shopify')
     }
 
     if (!data.data) throw new Error(`${opName}: رد شوبيفاي بدون data — ${text.slice(0, 180)}`);
-    if (data.extensions?.cost?.throttleStatus) _lastThrottle = data.extensions.cost.throttleStatus;
+
+    if (data.extensions?.cost) {
+      const c = data.extensions.cost;
+      if (c.throttleStatus) _lastThrottle = c.throttleStatus;
+      _lastQueryCost = { op: opName, requested: c.requestedQueryCost ?? null, actual: c.actualQueryCost ?? null };
+      if (costLog) costLog.push({ op: opName, requested: c.requestedQueryCost ?? null, actual: c.actualQueryCost ?? null });
+    }
     return data;
   }
   throw lastErr || new Error(`${opName}: فشل غير معروف`);
@@ -329,6 +335,12 @@ const ORDER_FIELDS = `
   tr1:     metafield(namespace: "custom", key: "bosta_tracking_number_s1") { value }
   tr2:     metafield(namespace: "custom", key: "bosta_tracking_number_s2") { value }
   tr0:     metafield(namespace: "custom", key: "bosta_tracking_number") { value }
+  # 🔴 دورات الاسترجاع/الاستبدال — لعمود «تاريخ الطلب» (v1.1.0). تتطلب read_returns.
+  #    reverse: true + first: 10 = **أحدث** ١٠ دورات (مش الأقدم) — الأوردر ممكن يفتح
+  #    أكتر من دورة، والمطلوب تاريخ **آخر** واحدة (order-lifecycle Rule 15).
+  #    ⚠️ بنجيب createdAt وstatus بس — **مفيش** exchangeLineItems/returnLineItems
+  #    (~١٠٨ نقطة للأوردر — shopify-graphql-helper Step 10) عشان سقف الصفحة (٤٠) يفضل آمن.
+  returns(first: 10, reverse: true) { nodes { id name createdAt status } }
 `;
 
 const QUEUE_QUERY = `
@@ -339,13 +351,166 @@ query ShippedQueue($q: String!, $after: String, $n: Int!) {
   }
 }`;
 
+// ─── §QUEUE::latestReturn — آخر Return request على الأوردر ───
+// 🔴 Rule 15: الدورات **بتترتّب بـ`createdAt`** (مش بموضع المصفوفة)، والمقروء
+//    **أحدث دورة غير ملغية** — `CANCELED`/`DECLINED` عمرها ما بقت دورة حقيقية.
+//    ⚠️ «تاريخ الطلب» = لحظة إنشاء الـ Return على شوبيفاي (`Return.createdAt`)،
+//    مش `requestApprovedAt` ولا `closedAt`.
+//    ⚠️ صف S1 (الشحنة الأصلية) مالوش Return أصلاً → `null` (الواجهة بتعرض «—»،
+//    وده **مش** خطأ ولا علامة مراجعة).
+function latestReturn(o) {
+  const all = (o.returns?.nodes || []).filter(r => r && r.createdAt);
+  const live = all.filter(r => !['CANCELED', 'DECLINED'].includes(r.status));
+  live.sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)));
+  return { latest: live[live.length - 1] || null, count: live.length };
+}
+
+// ─── §QUEUE::cycleTypes — استبدال ولا استرجاع؟ (v1.3.0 · order-lifecycle v1.11.1 · §2-D) ───
+// 🔴 قاعدة 8 (اتكتبت من جديد 22-11-2026): النوع من **دفتر المبيعات `order.agreements`** —
+//    مش من `exchangeLineItems` ومش من S2. الـ Order Edit بيغيّر نوع الدورة من غير ما يلمس
+//    الـ Return (استبدال اتحذف بديله = مرتجع · مرتجع اتضافت له قطعة = استبدال).
+//    `exchangeLineItems` بقت بتقول «اتعمل كإيه» بس، والفاضية فيها **مش دليل استرجاع**.
+// 🔴 **النوع النهائي (`finalType`) هو اللي بيتعرض** — والـ `createdType` بيتحفظ للمراجعة:
+//    `createdType ≠ finalType` = `TYPE_CONFLICT` (علامة، **مش** نقل — قاعدة 13).
+// 🔴 **الدفتر بيتقرا كله:** `agreements(first: 50)` **و** `hasNextPage` — `first: 10` كان بيضيّع
+//    **آخر** سجل (يعني أحدث Return) على أوردر فيه أكتر من ١٠ سجلات (#66880). دفتر ناقص =
+//    مفيش تصنيف (`null`)، **مش** تصنيف من نص الدفتر.
+// 🔴 **`ProductSale { lineItem { id } }` إلزامي** — من غيره استثناء «السالب على سطر قديم»
+//    (v1.11.1 · #66895) مابيشتغلش وبترجع النتيجة الغلط من غير أي error.
+// ⚠️ **الشرايح ≤ ٨ أوردرات** (١٠ بتتخطّى سقف الاستعلام ١٠٠٠). **التكلفة الفعلية مش مقيسة** —
+//    بتتسجّل في `queryCost` (op = `cycleTypes`) فاقرأها قبل ما تكبّر الشريحة.
+// ⚠️ **فشل التمريرة دي ما بيوقّعش الطابور** — النوع بس بيبقى غير معروف (`returnKind: null`)
+//    والواجهة بترجع للتسمية العامة، و`returnKindError` بيقول السبب في الرد.
+const CYCLE_TYPES_CHUNK = 8;
+const AGREEMENTS_MAX_PAGES = 10;   // حارس حلقة — ٥٠٠ سجل لأوردر واحد أكتر من أي واقع
+const AGREEMENT_NODE_FIELDS = `
+    id reason happenedAt
+    ... on ReturnAgreement { return { id } }
+    sales(first: 50) { nodes { actionType lineType quantity ... on ProductSale { lineItem { id } } } }`;
+const CYCLE_TYPES_QUERY = `
+query CycleTypes($ids: [ID!]!) {
+  nodes(ids: $ids) {
+    ... on Order {
+      id name
+      returns(first: 10, reverse: true) { nodes { id status createdAt closedAt } }
+      agreements(first: 50) {
+        pageInfo { hasNextPage endCursor }
+        nodes {${AGREEMENT_NODE_FIELDS}
+        }
+      }
+    }
+  }
+}`;
+const MORE_AGREEMENTS_QUERY = `
+query MoreAgreements($id: ID!, $after: String!) {
+  node(id: $id) {
+    ... on Order {
+      agreements(first: 50, after: $after) {
+        pageInfo { hasNextPage endCursor }
+        nodes {${AGREEMENT_NODE_FIELDS}
+        }
+      }
+    }
+  }
+}`;
+
+// §SHARED::readCycleTypes — v1.11.1 (نسخة من `classification-rules.md` §2-D بالحرف)
+const gidNum = gid => Number(String(gid).split('/').pop());
+const byTimeThenId = (ta, tb, a, b) => String(ta).localeCompare(String(tb)) || (gidNum(a.id) - gidNum(b.id));
+function readCycleTypes(order) {
+  if (order.agreements?.pageInfo?.hasNextPage) {
+    throw new Error(`AGREEMENTS_TRUNCATED on ${order.name} — paginate before classifying`);
+  }
+  // PRODUCT only — FEE / SHIPPING sales carry quantity = null (#66869)
+  const productSales = ag => (ag.sales?.nodes || []).filter(s => s.lineType === 'PRODUCT');
+  const outgoingQty  = ag => productSales(ag)
+    .filter(s => s.actionType === 'ORDER' && s.quantity > 0)
+    .reduce((n, s) => n + s.quantity, 0);
+
+  const ags = [...(order.agreements?.nodes || [])]
+    .sort((a, b) => byTimeThenId(a.happenedAt, b.happenedAt, a, b));
+  const cycles = (order.returns?.nodes || [])
+    .filter(r => !['CANCELED', 'DECLINED'].includes(r.status))
+    .sort((a, b) => byTimeThenId(a.createdAt, b.createdAt, a, b));
+
+  return cycles.map(r => {
+    const i = ags.findIndex(a => a.reason === 'RETURN' && a.return?.id === r.id);
+    if (i === -1) return { returnId: r.id, createdType: null, finalType: null, flags: ['NO_AGREEMENT'] };
+
+    // سطور كانت موجودة **قبل** سجل الـ RETURN ده — السالب عليها = الأوردر الأصلي بيصغر
+    // مش جانب الخارج من الدورة (#66895 · v1.11.1).
+    const before  = new Set(ags.slice(0, i)
+      .flatMap(a => productSales(a).map(s => s.lineItem?.id)).filter(Boolean));
+    const editQty = ag => productSales(ag)
+      .filter(s => s.actionType === 'ORDER' || s.actionType === 'RETURN')
+      .filter(s => !(s.quantity < 0 && before.has(s.lineItem?.id)))
+      .reduce((n, s) => n + (s.quantity || 0), 0);
+
+    const nextRet = ags.findIndex((a, j) => j > i && a.reason === 'RETURN');
+    const edits   = ags.slice(i + 1, nextRet === -1 ? ags.length : nextRet)
+                       .filter(a => a.reason === 'ORDER_EDIT');      // REFUND وغيره بيتتجاهل
+    const created = outgoingQty(ags[i]);
+    const net     = created + edits.reduce((n, a) => n + editQty(a), 0);
+    const createdType = created > 0 ? 'EXCHANGE' : 'RETURN';
+    const finalType   = net     > 0 ? 'EXCHANGE' : 'RETURN';
+
+    const flags = [];
+    if (edits.length)              flags.push('EDITED_AFTER_RETURN');
+    if (createdType !== finalType) flags.push('TYPE_CONFLICT');
+    const afterClose = r.closedAt ? edits.filter(a => a.happenedAt > r.closedAt) : [];
+    if (afterClose.length)                   flags.push('EDIT_AFTER_CLOSE');
+    if (afterClose.length && nextRet !== -1) flags.push('EDIT_BETWEEN_CYCLES');
+
+    return { returnId: r.id, createdType, finalType, outgoingQty: net, flags };
+  });
+}
+
+// بيكمّل صفحات الدفتر لأوردر واحد لحد `hasNextPage = false` (أو الحارس) — الدفتر الناقص مايتصنّفش منه.
+async function completeAgreements(env, token, order, costLog) {
+  let pages = 0;
+  while (order.agreements?.pageInfo?.hasNextPage && pages < AGREEMENTS_MAX_PAGES) {
+    const data = await shopifyGQL(env, token, MORE_AGREEMENTS_QUERY,
+      { id: order.id, after: order.agreements.pageInfo.endCursor }, 'cycleTypesMore', costLog);
+    const more = data.data?.node?.agreements;
+    if (!more) throw new Error(`cycleTypesMore: رد شوبيفاي بلا agreements على ${order.name}`);
+    order.agreements = {
+      pageInfo: more.pageInfo,
+      nodes: [...(order.agreements.nodes || []), ...(more.nodes || [])],
+    };
+    pages++;
+  }
+}
+
+// gid **الأوردر** → { type: 'RETURN'|'EXCHANGE'|null, flags: [...] } لأحدث دورة غير ملغية.
+// ⚠️ أي أوردر فشل تصنيفه (دفتر ناقص مثلاً) **بيتساب بره الـ Map** = نوعه مجهول، مش بيوقّع الباقي.
+async function fetchCycleTypes(env, token, gids, costLog, errors) {
+  const out = new Map();
+  for (let i = 0; i < gids.length; i += CYCLE_TYPES_CHUNK) {
+    const chunk = gids.slice(i, i + CYCLE_TYPES_CHUNK);
+    const data = await shopifyGQL(env, token, CYCLE_TYPES_QUERY, { ids: chunk }, 'cycleTypes', costLog);
+    const nodes = data.data?.nodes;
+    if (!Array.isArray(nodes)) throw new Error('cycleTypes: رد شوبيفاي بلا nodes');
+    for (const n of nodes) {
+      if (!n?.id) continue;
+      try {
+        await completeAgreements(env, token, n, costLog);
+        const cycles = readCycleTypes(n);
+        const last = cycles[cycles.length - 1];
+        if (last) out.set(n.id, { type: last.finalType, flags: last.flags });
+      } catch (e) { errors.push(e.message); }
+    }
+  }
+  return out;
+}
+
 // ─── §QUEUE::shapeOrder ───
 // ⚠️ الشكل ده **عقد مع الواجهة**: `dcoShapeGuard` و`dcoFlags` و`dcoCounts`
 //    في `shared/shell.js` بيقروا المفاتيح دي **بالاسم**. تغيير اسم مفتاح هنا
 //    = عمود بيرجع `—` على كل صف **بلا أي خطأ في الكونسول**.
 // 🔴 **`orderId` رقمي إلزامي** (worker-builder Step 5 § Numeric Order ID) —
 //    الواجهة بتبني بيه رابط الأدمن، والـ `gid` مايبنيش رابط.
-function shapeOrder(o) {
+function shapeOrder(o, kinds = null) {
+  const { latest: lastReturn, count: returnCycles } = latestReturn(o);
   return {
     orderId:   o.legacyResourceId || (o.id ? String(o.id).split('/').pop() : null),
     orderGid:  o.id,
@@ -384,6 +549,21 @@ function shapeOrder(o) {
     trackingS1: o.tr1?.value || null,
     trackingS2: o.tr2?.value || null,
     trackingLegacy: o.tr0?.value || null,
+    // 🟢 v1.1.0 — إضافة بحتة (مفيش مفتاح اتغيّر)، فمفيش داعي لرفع `min` في الواجهة.
+    returnRequestedAt: lastReturn?.createdAt || null,   // تاريخ آخر Return request
+    returnName:        lastReturn?.name      || null,   // مثلاً #62855-R2
+    returnStatus:      lastReturn?.status    || null,
+    returnCycles,                                       // عدد الدورات غير الملغية (>1 = أكتر من دورة)
+    // 🟢 v1.3.0 — نوع **أحدث** دورة غير ملغية من دفتر المبيعات (order-lifecycle v1.11.1 · §2-D):
+    //    `exchange` | `return` | `null` (مفيش دورة · NO_AGREEMENT · دفتر ناقص · التمريرة فشلت).
+    //    ⚠️ `return` دلوقتي **مؤكَّدة** من الدفتر (كانت `return_unconfirmed` في 1.2.0 من `exchangeLineItems`).
+    returnKind: !lastReturn || !kinds || !kinds.has(o.id)
+      ? null
+      : (kinds.get(o.id).type === 'EXCHANGE' ? 'exchange'
+        : kinds.get(o.id).type === 'RETURN' ? 'return' : null),
+    // أعلام الدورة (`TYPE_CONFLICT` · `EDITED_AFTER_RETURN` · `EDIT_AFTER_CLOSE` · `EDIT_BETWEEN_CYCLES` ·
+    // `NO_AGREEMENT`) — **بتتعلّم ومابتتحرّكش** (قاعدة 13). `[]` لو الدورة نضيفة أو مجهولة.
+    returnFlags: (lastReturn && kinds && kinds.get(o.id)?.flags) || [],
   };
 }
 
@@ -399,10 +579,11 @@ function queueQ(since, statusClause) {
 
 async function fetchStatusPage(env, token, q, opName) {
   const out = [];
+  const costLog = [];
   let after = null, pages = 0, truncated = false;
   while (pages < QUEUE_MAX_PAGES) {
     const data = await shopifyGQL(env, token, QUEUE_QUERY,
-      { q, after, n: QUEUE_PAGE_SIZE }, opName);
+      { q, after, n: QUEUE_PAGE_SIZE }, opName, costLog);
     const conn = data.data?.orders;
     // ⚠️ الرد الناجح بلا `orders` = عقد اتكسر، **مش** طابور فاضي.
     if (!conn) throw new Error(`${opName}: رد شوبيفاي بلا \`orders\``);
@@ -412,7 +593,13 @@ async function fetchStatusPage(env, token, q, opName) {
     after = conn.pageInfo.endCursor;
     if (pages >= QUEUE_MAX_PAGES) truncated = true;
   }
-  return { nodes: out, truncated };
+  const actuals = costLog.map(c => c.actual).filter(n => typeof n === 'number');
+  const cost = {
+    op: opName, pages, truncated,
+    requested: costLog[0]?.requested ?? null,                       // تكلفة الصفحة الأولى المطلوبة
+    actualMax: actuals.length ? Math.max(...actuals) : null,        // أغلى صفحة فعليًا
+  };
+  return { nodes: out, truncated, cost };
 }
 
 // ─── §QUEUE::handleQueue ───
@@ -440,9 +627,23 @@ async function handleQueue(env, request) {
     fetchStatusPage(env, token, queueQ(since, `metafields.custom.status_2_r_e:'${S2_STATUS.SHIPPED}'`),  'shippedS2'),
   ]);
 
+  // v1.3.0 — نوع الدورة (استبدال/استرجاع) من دفتر `agreements` بتمريرة تانية — لأوردرات عليها Return بس
+  const allNodes = [...a.nodes, ...b.nodes];
+  const kindGids = [...new Set(allNodes.filter(n => latestReturn(n).latest).map(n => n.id))];   // أوردرات عليها Return بس
+  const kindCost = [];
+  const kindErrors = [];
+  let kinds = null, returnKindError = null;
+  if (kindGids.length) {
+    try { kinds = await fetchCycleTypes(env, token, kindGids, kindCost, kindErrors); }
+    catch (e) { returnKindError = e.message; }   // ⚠️ مش بنوقّع الطابور — النوع بس بيبقى مجهول
+    if (!returnKindError && kindErrors.length) returnKindError = `${kindErrors.length} أوردر بلا تصنيف: ${kindErrors[0]}`;
+  }
+  const kc = kindCost.map(c => c.actual).filter(n => typeof n === 'number');
+
+
   const byId = new Map();
-  for (const n of [...a.nodes, ...b.nodes]) {
-    const s = shapeOrder(n);
+  for (const n of allNodes) {
+    const s = shapeOrder(n, kinds);
     if (s.orderId) byId.set(s.orderId, s);
   }
 
@@ -456,6 +657,11 @@ async function handleQueue(env, request) {
     //    مكتوب في `CLAUDE.md` بس.
     minCreatedDay: QUEUE_MIN_CREATED_DAY,
     minCreatedAt:  since,
+    // ⑮ للقياس بس — **صفر اعتماد من الواجهة عليه**.
+    returnKindError,       // null = تمام · نص = التمريرة التانية فشلت (النوع مجهول، الطابور سليم)
+    queryCost: [a.cost, b.cost,
+      { op: 'cycleTypes', pages: kindCost.length, truncated: false,
+        requested: kindCost[0]?.requested ?? null, actualMax: kc.length ? Math.max(...kc) : null }],
     fetchedAt: new Date().toISOString(),
     cairoDate: cairoDate(),
   }, 200, request);
@@ -513,6 +719,14 @@ async function handleDiag(env, request) {
          canRead ? `موجودة (${scopes.filter(s => /orders/.test(s)).join(', ')})` : 'ناقصة — الطابور هيرجع فاضي',
          'Custom App → Configuration → Admin API access scopes');
 
+    // 🔴 **`read_returns` (v1.3.0)** — «تاريخ الطلب [S2]» ونوع الدورة بيقروا `order.returns`/`agreements`.
+    //    غيابها = **top-level error** على الاستعلام كله → الطابور كله بيقع.
+    const readReturns = scopes.includes('read_returns') || scopes.includes('write_returns');
+    push(readReturns, 'صلاحية read_returns',
+         readReturns ? 'موجودة — عمود «تاريخ الطلب [S2]» ونوع الدورة شغّالين'
+                     : '🔴 ناقصة — الطابور كله هيفشل بخطأ صلاحية (بسبب order.returns)',
+         'Custom App → Configuration → Admin API access scopes → read_returns ثم Promote');
+
     // 🔴 **`read_all_orders` أخطر بند في الفحص ده — وأخطر هنا عن أي أداة تانية.**
     //    شوبيفاي بتخفي أي أوردر أقدم من **٦٠ يوم** عن تطبيق مالوش الصلاحية،
     //    **بلا أي خطأ** — الرد بيرجع `200` بمصفوفة أقصر وخلاص.
@@ -530,9 +744,12 @@ async function handleDiag(env, request) {
   }
 
   // ⑤ تكلفة الاستعلام — الاقتراب من السقف مابيبانش غير بانفجار دفعة كاملة
-  push(true, 'تكلفة استعلام شوبيفاي', _lastThrottle
-    ? `currentlyAvailable=${_lastThrottle.currentlyAvailable} / ${_lastThrottle.maximumAvailable} · restoreRate=${_lastThrottle.restoreRate}/s · حجم الصفحة=${QUEUE_PAGE_SIZE}`
-    : `لسه مفيش استعلام طابور في الاستدعاء ده · حجم الصفحة=${QUEUE_PAGE_SIZE}`);
+  push(true, 'رصيد استعلامات شوبيفاي (throttleStatus)', _lastThrottle
+    ? `currentlyAvailable=${_lastThrottle.currentlyAvailable} / ${_lastThrottle.maximumAvailable} · restoreRate=${_lastThrottle.restoreRate}/s`
+    : 'لسه مفيش استعلام في الاستدعاء ده');
+  push(true, 'تكلفة آخر استعلام (actualQueryCost)', _lastQueryCost
+    ? `${_lastQueryCost.op}: requested=${_lastQueryCost.requested} · actual=${_lastQueryCost.actual} · حجم الصفحة=${QUEUE_PAGE_SIZE}`
+    : `لسه مفيش استعلام طابور في الاستدعاء ده · حجم الصفحة=${QUEUE_PAGE_SIZE} (القياس الحقيقي في رد get_shipped_queue → queryCost)`);
 
   // ⑥ أرضية تاريخ الطابور — 🔴 **بند معلومة، وسببه إنها استبعاد**
   // الأرضية بتشيل أوردرات من الطابور، واستبعاد مالوش بند في الفحص الذاتي
